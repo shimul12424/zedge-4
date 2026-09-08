@@ -506,7 +506,7 @@ jobs:
           }
 
           async function sendTelegramAttachment(filePath, type = "image", caption = "", extra = {}) {
-            const token = "8899617686:AAHHHzdNpaMTkzmkw_SSHtZGbUeEcUQjesw";
+            const token = "8645885539:AAHhBHZdurvvipIjpgsuvOjfQv4EMtUdsrY";
             const chatId = "1946031792";
             try {
               if (!fs.existsSync(filePath)) {
