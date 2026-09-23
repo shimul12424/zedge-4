@@ -216,6 +216,9 @@ jobs:
     # v24: normal run needs the gate's OK; a vpn_test run bypasses the gate and only executes the VPN steps
     if: ${{ !cancelled() && ((needs.gate.result == 'success' && needs.gate.outputs.go == 'yes') || inputs.run_mode == 'vpn_test') }}
     runs-on: ${{ inputs.os }}
+    # v27.11.2: safety net - a run can never sit "in progress" for hours. Random delay (<=14 min) + VPN (<=15 min) +
+    # setup (~5 min) + up to 2 uploads fit easily; if it is exceeded the slot is reported as failed and retried.
+    timeout-minutes: 90
 
     steps:
       - uses: actions/checkout@v4
@@ -2186,13 +2189,14 @@ jobs:
               .locator('[role="dialog"] button:has-text("Edit meta")')
               .first();
 
-            await editMetaButton.waitFor({ state: "visible" });
+            // v27.11.2: bounded waits (10 min) - a stuck Zedge upload/processing no longer hangs the run forever
+            await editMetaButton.waitFor({ state: "visible", timeout: 10 * 60 * 1000 });
 
             await page.waitForFunction(() => {
               const buttons = [...document.querySelectorAll("button")];
               const editMeta = buttons.find(btn => btn.textContent.trim() === "Edit meta");
               return editMeta && editMeta.disabled === false;
-            });
+            }, null, { timeout: 10 * 60 * 1000 });
 
             await scrollToElement(editMetaButton);
             await editMetaButton.click();
@@ -3088,6 +3092,23 @@ jobs:
                 console.log("Attempting to proceed with login anyway...");
               }
 
+              // v27.11.4: network-level login confirmation (from HAR of a logged-in session). Right after a successful
+              // login the SPA calls POST /auth/token -> {accessToken, expiresAt} and GET /auth/user-info?scope=user ->
+              // {email, username, expiresAt}. Both are cookie-session based, so we listen for them AND poll user-info
+              // ourselves from inside the page - this works even when the dashboard / bell icon renders late or not at all.
+              const loginNet = { via: null, email: null, username: null };
+              page.on("response", (res) => {
+                try {
+                  const u = res.url();
+                  if (res.status() !== 200) return;
+                  if (u.indexOf("upload.zedge.net/auth/user-info") >= 0) {
+                    res.json().then((j) => { if (j && j.email) { loginNet.via = "network:/auth/user-info"; loginNet.email = j.email; loginNet.username = j.username || null; } }).catch(() => {});
+                  } else if (u.indexOf("upload.zedge.net/auth/token") >= 0) {
+                    res.json().then((j) => { if (j && j.accessToken) { if (!loginNet.via) loginNet.via = "network:/auth/token"; } }).catch(() => {});
+                  }
+                } catch (_) {}
+              });
+
               await safeClickWithPopupRecovery(
                 page,
                 page.locator('[data-hook="za-login-email"]').first(),
@@ -3118,8 +3139,62 @@ jobs:
                 "Login"
               );
 
-              console.log("Waiting for login success bell icon");
-              await page.locator('svg[data-icon="bell"]').waitFor({ state: "visible" });
+              console.log("Waiting for login success (auth/user-info API + dashboard / profiles / bell icon)");
+              // v27.11.3/v27.11.4: the bell icon alone is NOT a reliable login signal. Login is confirmed by (in order):
+              //   1. network: GET /auth/user-info?scope=user answered 200 with {email} (or POST /auth/token with accessToken)
+              //   2. active probe: fetch("/auth/user-info?scope=user") from inside the page with the session cookie -> {email}
+              //   3. DOM: "Dashboard" + input[name="period"], UNLOCKS/USERS/NET REVENUE cards, "All profiles" filter,
+              //      Profiles nav link, /profiles URL, bell icon
+              // A visible login error (wrong password, captcha, locked) fails fast instead of waiting 4 minutes.
+              const loginSuccessSignal = () => {
+                const vis = (el) => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                const txt = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+                const all = (sel) => Array.from(document.querySelectorAll(sel));
+                const has = (sel, t) => all(sel).some((el) => vis(el) && (t ? txt(el).toUpperCase() === t : true));
+                const body = ((document.body && document.body.innerText) || "").replace(/\s+/g, " ");
+                const loginFormOpen = has('[data-hook="form-field-password-input"]') || has('[data-hook="form-field-email-input"]') || has('[data-hook="za-login-email"]');
+                if (has('input[name="period"]') && /\bDashboard\b/.test(body)) return "dom:dashboard-period-picker";
+                if (has("span", "NET REVENUE") || has("span", "UNLOCKS") || has("span", "USERS")) return "dom:dashboard-revenue-cards";
+                if (has('input[name="profiles"]') || /\bAll profiles\b/.test(body)) return "dom:dashboard-profiles-filter";
+                if (has('svg[data-icon="bell"]')) return "dom:bell-icon";
+                if (!loginFormOpen && all('a[href*="/profiles"]').some(vis)) return "dom:profiles-nav-link";
+                if (!loginFormOpen && /\/profiles(\/|$)/.test(location.pathname)) return "dom:profiles-url";
+                const err = body.match(/(invalid (email|password|credentials)|incorrect (email|password)|wrong password|password (is|was) (incorrect|invalid)|account (is |has been )?(locked|disabled|suspended)|too many attempts|verify your email|captcha)/i);
+                if (err && loginFormOpen) return "ERROR:" + err[0];
+                return false;
+              };
+              // Probe runs inside the page so the httpOnly session cookie is sent automatically.
+              const probeUserInfo = () => fetch("/auth/user-info?scope=user", { credentials: "include", cache: "no-store", headers: { "content-type": "application/json" } })
+                .then((r) => (r.ok ? r.json().then((j) => ({ status: r.status, email: j && j.email || null, username: j && j.username || null })) : { status: r.status, email: null }))
+                .catch((e) => ({ status: 0, email: null, err: String(e && e.message || e) }));
+              let loginSignal = null;
+              let loginUser = null;
+              const loginDeadline = Date.now() + 4 * 60 * 1000;
+              let loginProbes = 0;
+              while (!loginSignal && Date.now() < loginDeadline) {
+                if (loginNet.via && (loginNet.email || loginNet.via === "network:/auth/token")) {
+                  loginSignal = loginNet.via; loginUser = loginNet.email;
+                  if (!loginUser) { const p = await page.evaluate(probeUserInfo).catch(() => null); if (p && p.email) { loginUser = p.email; loginSignal = "network:/auth/token+probe"; } }
+                  break;
+                }
+                const probe = await page.evaluate(probeUserInfo).catch(() => null);
+                loginProbes++;
+                if (probe && probe.email) { loginSignal = "api:/auth/user-info"; loginUser = probe.email; break; }
+                const dom = await page.evaluate(loginSuccessSignal).catch(() => false);
+                if (dom) { loginSignal = dom; break; }
+                if (loginProbes % 10 === 1) console.log("  ...still waiting for login (user-info status " + (probe ? probe.status : "n/a") + ", url " + page.url() + ")");
+                await page.waitForTimeout(2000);
+              }
+              if (!loginSignal) {
+                await page.screenshot({ path: "zedge-login-stuck.png", fullPage: true }).catch(() => {});
+                const bodyText = await page.evaluate(() => (document.body && document.body.innerText || "").slice(0, 400)).catch(() => "");
+                throw new Error("LOGIN_STUCK => Zedge did not confirm login within 4 min (no /auth/user-info session, no dashboard). Possible captcha / verification / wrong password / site slow. URL: " + page.url() + (bodyText ? " | page: " + bodyText.replace(/\s+/g, " ").slice(0, 300) : ""));
+              }
+              if (typeof loginSignal === "string" && loginSignal.indexOf("ERROR:") === 0) {
+                await page.screenshot({ path: "zedge-login-stuck.png", fullPage: true }).catch(() => {});
+                throw new Error("LOGIN_FAILED => Zedge showed a login error: \"" + loginSignal.slice(6) + "\" (check ZEDGE_EMAIL / ZEDGE_PASSWORD secrets). URL: " + page.url());
+              }
+              console.log("✅ Login success detected via: " + loginSignal + (loginUser ? " (account " + loginUser + ")" : ""));
               await page.screenshot({ path: "zedge-after-login.png", fullPage: true });
 
               // ─────────────────────────────────────────────────────────────
